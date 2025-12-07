@@ -1,8 +1,11 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Nest;
 
@@ -10,95 +13,91 @@ class Program
 {
     static async Task Main(string[] args)
     {
-        var counter = new UniqueFileCounter("https://:9200");
+        var counter = new ParallelUniqueFileCounter("");
 
         var startDate = DateTime.UtcNow.Date;
-        var endDate = startDate.AddYears(-3);
+        var endDate = startDate.AddDays(-14);
+        //var endDate = startDate.AddMonths(-6);
 
-        Console.WriteLine($"Counting ACTUAL unique SHA1 hashes from {startDate:yyyy-MM-dd} back to {endDate:yyyy-MM-dd}");
-        Console.WriteLine("This will collect ALL unique SHA1s in memory to deduplicate across days.\n");
+        Console.WriteLine("╔════════════════════════════════════════════════════════════════════════════╗");
+        Console.WriteLine("║         PARALLEL UNIQUE SHA1 FILE COUNTER - 2 WEEK                         ║");
+        Console.WriteLine("╚════════════════════════════════════════════════════════════════════════════╝");
+        Console.WriteLine($"Start Date:      {startDate:yyyy-MM-dd}");
+        Console.WriteLine($"End Date:        {endDate:yyyy-MM-dd}");
+        Console.WriteLine($"Total Days:      {(startDate - endDate).Days}");
+        Console.WriteLine();
 
+        var totalStopwatch = Stopwatch.StartNew();
         var uniqueCount = await counter.CountUniqueFilesAsync(startDate, endDate);
+        totalStopwatch.Stop();
 
-        Console.WriteLine($"\n================ FINAL RESULT ================");
-        Console.WriteLine($"Total ACTUAL Unique SHA1 Hashes: {uniqueCount:N0}");
-        Console.WriteLine($"==============================================");
+        Console.WriteLine();
+        Console.WriteLine("╔════════════════════════════════════════════════════════════════════════════╗");
+        Console.WriteLine("║                           FINAL RESULTS                                    ║");
+        Console.WriteLine("╚════════════════════════════════════════════════════════════════════════════╝");
+        Console.WriteLine($"Total Unique SHA1 Hashes:  {uniqueCount:N0}");
+        Console.WriteLine($"Total Processing Time:     {totalStopwatch.Elapsed.TotalHours:F2}h ({totalStopwatch.Elapsed.TotalMinutes:F1}m)");
+        Console.WriteLine();
 
-        // Print timing statistics
-        counter.PrintTimingStatistics();
+        // Print statistics
+        counter.PrintStatistics();
 
-        // Save detailed result to file
-        var resultFileName = $"UniqueFilesCount_{DateTime.UtcNow:yyyyMMdd_HHmmss}.txt";
+        // Save detailed report to file
+        await SaveReport(counter, startDate, endDate, uniqueCount, totalStopwatch.Elapsed);
+    }
+
+    static async Task SaveReport(ParallelUniqueFileCounter counter, DateTime startDate, DateTime endDate,
+        long uniqueCount, TimeSpan totalTime)
+    {
+        var resultFileName = $"UniqueFiles_6Months_{DateTime.UtcNow:yyyyMMdd_HHmmss}.txt";
         var sb = new StringBuilder();
 
-        sb.AppendLine("================================================================================");
-        sb.AppendLine("                        UNIQUE FILE COUNT REPORT");
-        sb.AppendLine("================================================================================");
-        sb.AppendLine($"Generated: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
-        sb.AppendLine($"Date Range: {endDate:yyyy-MM-dd} to {startDate:yyyy-MM-dd}");
-        sb.AppendLine($"Total Days Processed: {(startDate - endDate).Days}");
+        sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
+        sb.AppendLine("                     UNIQUE FILE COUNT REPORT - 6 MONTHS");
+        sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
+        sb.AppendLine($"Generated:              {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
+        sb.AppendLine($"Date Range:             {endDate:yyyy-MM-dd} to {startDate:yyyy-MM-dd}");
+        sb.AppendLine($"Total Days Processed:   {(startDate - endDate).Days}");
+        sb.AppendLine($"Total Processing Time:  {totalTime.TotalHours:F2}h ({totalTime.TotalMinutes:F1}m)");
         sb.AppendLine();
-        sb.AppendLine("================================================================================");
-        sb.AppendLine("                             FINAL RESULT");
-        sb.AppendLine("================================================================================");
+
+        sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
+        sb.AppendLine("                              FINAL RESULT");
+        sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine($"Total Unique SHA1 Hashes: {uniqueCount:N0}");
 
-        // Get file info
         var fileInfo = counter.GetFileInfo();
         var totalSize = fileInfo.Values.Where(s => s > 0).Sum();
         var filesWithSize = fileInfo.Count(kvp => kvp.Value > 0);
         var avgSize = filesWithSize > 0 ? fileInfo.Values.Where(s => s > 0).Average() : 0;
 
-        sb.AppendLine($"Total Size of All Files: {FormatBytes(totalSize)}");
-        sb.AppendLine($"Average File Size: {FormatBytes((long)avgSize)}");
-        sb.AppendLine($"Files with Size Info: {filesWithSize:N0} ({(filesWithSize * 100.0 / fileInfo.Count):F1}%)");
+        sb.AppendLine($"Total Size of All Files:  {FormatBytes(totalSize)}");
+        sb.AppendLine($"Average File Size:        {FormatBytes((long)avgSize)}");
+        sb.AppendLine($"Files with Size Info:     {filesWithSize:N0} ({(filesWithSize * 100.0 / fileInfo.Count):F1}%)");
         sb.AppendLine();
 
-        // Add daily statistics
-        sb.AppendLine("================================================================================");
-        sb.AppendLine("                          DAILY STATISTICS");
-        sb.AppendLine("================================================================================");
+        // Daily statistics
+        sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
+        sb.AppendLine("                           DAILY STATISTICS");
+        sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
+        sb.AppendLine("Date         | New Files    | Total Files  | Processing Time");
+        sb.AppendLine("-------------+--------------+--------------+------------------");
+
         var dailyStats = counter.GetDailyStatistics();
         foreach (var day in dailyStats.OrderByDescending(x => x.Key))
         {
-            sb.AppendLine($"{day.Key:yyyy-MM-dd}: {day.Value.NewFiles:N0} new files, Total so far: {day.Value.TotalFiles:N0}");
+            sb.AppendLine($"{day.Key:yyyy-MM-dd} | {day.Value.NewFiles,12:N0} | {day.Value.TotalFiles,12:N0} | {day.Value.ProcessingTime.TotalMinutes,10:F1}m");
         }
         sb.AppendLine();
 
-        // Add timing statistics to file
-        var timings = counter.GetChunkTimings();
-        if (timings.Count > 0)
-        {
-            var avgTime = timings.Values.Average(t => t.TotalSeconds);
-            var maxTime = timings.Values.Max(t => t.TotalSeconds);
-            var minTime = timings.Values.Min(t => t.TotalSeconds);
-            var totalTime = TimeSpan.FromSeconds(timings.Values.Sum(t => t.TotalSeconds));
-
-            sb.AppendLine("================================================================================");
-            sb.AppendLine("                          TIMING STATISTICS");
-            sb.AppendLine("================================================================================");
-            sb.AppendLine($"Total processing time: {totalTime.TotalHours:F2}h ({totalTime.TotalMinutes:F1}m)");
-            sb.AppendLine($"Average chunk time: {avgTime:F2}s");
-            sb.AppendLine($"Fastest chunk: {minTime:F2}s");
-            sb.AppendLine($"Slowest chunk: {maxTime:F2}s");
-            sb.AppendLine($"Total chunks processed: {timings.Count}");
-            sb.AppendLine();
-
-            sb.AppendLine("Top 20 Slowest Chunks:");
-            foreach (var kvp in timings.OrderByDescending(x => x.Value.TotalSeconds).Take(20))
-            {
-                sb.AppendLine($"  {kvp.Key}: {kvp.Value.TotalSeconds:F2}s");
-            }
-            sb.AppendLine();
-        }
-
+        // Failed chunks
         var failedChunks = counter.GetFailedChunks();
         if (failedChunks.Count > 0)
         {
-            sb.AppendLine("================================================================================");
+            sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
             sb.AppendLine("                            FAILED CHUNKS");
-            sb.AppendLine("================================================================================");
-            sb.AppendLine($"WARNING: {failedChunks.Count} time chunks failed after all retries:");
+            sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
+            sb.AppendLine($"⚠ WARNING: {failedChunks.Count} chunks failed after all retries:");
             sb.AppendLine();
             foreach (var kvp in failedChunks.OrderBy(x => x.Key))
             {
@@ -107,10 +106,10 @@ class Program
             sb.AppendLine();
         }
 
-        // Add all unique SHA1s with file sizes
-        sb.AppendLine("================================================================================");
-        sb.AppendLine("                     ALL UNIQUE FILES (SHA1 + Size)");
-        sb.AppendLine("================================================================================");
+        // All unique SHA1s with sizes
+        sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
+        sb.AppendLine("                    ALL UNIQUE FILES (SHA1 + Size)");
+        sb.AppendLine("════════════════════════════════════════════════════════════════════════════════");
         sb.AppendLine($"Total Files: {fileInfo.Count:N0}");
         sb.AppendLine();
         sb.AppendLine("SHA1                                     | File Size");
@@ -123,11 +122,12 @@ class Program
         }
 
         await File.WriteAllTextAsync(resultFileName, sb.ToString());
-        Console.WriteLine($"\n✓ Result saved to: {resultFileName}");
+        Console.WriteLine($"✓ Detailed report saved to: {resultFileName}");
     }
 
     static string FormatBytes(long bytes)
     {
+        if (bytes == 0) return "0 B";
         string[] sizes = { "B", "KB", "MB", "GB", "TB" };
         double len = bytes;
         int order = 0;
@@ -144,17 +144,21 @@ public class FileStatistics
 {
     public int NewFiles { get; set; }
     public int TotalFiles { get; set; }
+    public TimeSpan ProcessingTime { get; set; }
 }
 
-public class UniqueFileCounter
+public class ParallelUniqueFileCounter
 {
     private readonly IElasticClient _client;
-    private readonly Dictionary<string, long> _fileInfo = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, int> _failedChunks = new Dictionary<string, int>();
-    private readonly Dictionary<string, TimeSpan> _chunkTimings = new Dictionary<string, TimeSpan>();
-    private readonly Dictionary<DateTime, FileStatistics> _dailyStatistics = new Dictionary<DateTime, FileStatistics>();
+    private readonly ConcurrentDictionary<string, long> _fileInfo = new ConcurrentDictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, int> _failedChunks = new ConcurrentDictionary<string, int>();
+    private readonly ConcurrentDictionary<DateTime, FileStatistics> _dailyStatistics = new ConcurrentDictionary<DateTime, FileStatistics>();
+    private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(360); // Max 360 concurrent tasks
 
-    public UniqueFileCounter(string elasticsearchUrl)
+    private long _totalChunksProcessed = 0;
+    private long _totalChunksFailed = 0;
+
+    public ParallelUniqueFileCounter(string elasticsearchUrl)
     {
         var settings = new ConnectionSettings(new Uri(elasticsearchUrl))
             .BasicAuthentication("", "")
@@ -172,21 +176,22 @@ public class UniqueFileCounter
         var totalDays = (startDate - endDate).Days;
         var processedDays = 0;
 
-        Console.WriteLine("Processing daily batches and deduplicating...\n");
+        Console.WriteLine("Starting parallel processing...\n");
 
         while (currentDate >= endDate)
         {
             var nextDate = currentDate.AddDays(-1);
             processedDays++;
 
-            Console.Write($"[{processedDays}/{totalDays}] {currentDate:yyyy-MM-dd} ");
+            var dayStopwatch = Stopwatch.StartNew();
+            var beforeCount = _fileInfo.Count;
+
+            Console.Write($"[{processedDays,4}/{totalDays}] {currentDate:yyyy-MM-dd} ");
 
             try
             {
-                var beforeCount = _fileInfo.Count;
-
-                // Process day in chunks with retry logic
-                var (successCount, failCount) = await ProcessDayInChunks(currentDate);
+                await ProcessDayParallel(currentDate);
+                dayStopwatch.Stop();
 
                 var afterCount = _fileInfo.Count;
                 var newUnique = afterCount - beforeCount;
@@ -196,350 +201,302 @@ public class UniqueFileCounter
                 _dailyStatistics[currentDate] = new FileStatistics
                 {
                     NewFiles = newUnique,
-                    TotalFiles = afterCount
+                    TotalFiles = afterCount,
+                    ProcessingTime = dayStopwatch.Elapsed
                 };
 
-                if (failCount > 0)
-                {
-                    Console.WriteLine($" ⚠ New: {newUnique:N0} | Total: {afterCount:N0} ({percentage:F1}%) | Failed chunks: {failCount}/24");
-                }
-                else
-                {
-                    Console.WriteLine($" ✓ New: {newUnique:N0} | Total: {afterCount:N0} ({percentage:F1}%)");
-                }
+                Console.WriteLine($"✓ New: {newUnique,10:N0} | Total: {afterCount,11:N0} ({percentage,5:F1}%) | Time: {dayStopwatch.Elapsed.TotalMinutes,6:F1}m");
             }
             catch (Exception ex)
             {
-                Console.WriteLine($" ✗ ERROR: {ex.Message}");
+                dayStopwatch.Stop();
+                Console.WriteLine($"✗ ERROR: {ex.Message}");
             }
 
             currentDate = nextDate;
-            await Task.Delay(100);
 
-            // Memory check every 100 days
-            if (processedDays % 100 == 0)
+            // Memory check every 30 days
+            if (processedDays % 30 == 0)
             {
                 var memoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
-                Console.WriteLine($"  └─ Memory usage: {memoryMB:N0} MB");
+                Console.WriteLine($"     └─ Memory: {memoryMB:N0} MB | Unique SHA1s: {_fileInfo.Count:N0}");
             }
         }
 
-        // Report failed chunks at the end
+        // Report failed chunks
         if (_failedChunks.Count > 0)
         {
-            Console.WriteLine($"\n⚠ WARNING: {_failedChunks.Count} time chunks failed after all retries:");
-            foreach (var kvp in _failedChunks.OrderByDescending(x => x.Value).Take(20))
-            {
-                Console.WriteLine($"  - {kvp.Key} (failed {kvp.Value} times)");
-            }
+            Console.WriteLine();
+            Console.WriteLine($"⚠ WARNING: {_failedChunks.Count} chunks failed after all retries");
         }
 
         return _fileInfo.Count;
     }
 
-    private async Task<(int successCount, int failCount)> ProcessDayInChunks(DateTime date)
+    private async Task ProcessDayParallel(DateTime date)
     {
-        var nextDate = date.AddDays(1);
-        int successCount = 0;
-        int failCount = 0;
-        var dayStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var tasks = new List<Task>();
+        var batchSize = 360; // 360 seconds per batch = 6 minutes
+        var totalBatches = 24 * 60 * 60 / batchSize; // 240 batches per day
 
-        // Process day in 1-hour chunks (changed from 4-hour)
-        for (int hour = 0; hour < 24; hour += 1)
+        var successCount = 0;
+        var failCount = 0;
+        var batchProgress = 0;
+
+        var hourStopwatch = new Stopwatch();
+        hourStopwatch.Start();
+
+        for (int batchNum = 0; batchNum < totalBatches; batchNum++)
         {
-            var chunkStart = date.AddHours(hour);
-            var chunkEnd = date.AddHours(hour + 1);
+            var batchTasks = new List<Task>();
+            var startSecond = batchNum * batchSize;
 
-            var success = await ProcessTimeChunkWithRetry(chunkStart, chunkEnd);
-
-            if (success)
+            // Create tasks for this batch (360 seconds)
+            for (int i = 0; i < batchSize; i++)
             {
-                successCount++;
+                var second = startSecond + i;
+                var chunkStart = date.AddSeconds(second);
+                var chunkEnd = chunkStart.AddSeconds(1);
+
+                batchTasks.Add(ProcessSecondChunkWithRetry(chunkStart, chunkEnd));
             }
-            else
+
+            // Wait for this batch to complete
+            await Task.WhenAll(batchTasks);
+
+            batchProgress++;
+
+            // Print progress indicator every 10 batches (every hour)
+            if (batchProgress % 10 == 0)
             {
-                failCount++;
+                hourStopwatch.Stop();
+                Console.WriteLine($"\nHour #{batchProgress / 10} completed in {hourStopwatch.Elapsed}.");
+
+                // Restart for next hour
+                hourStopwatch.Restart();
             }
         }
-
-        dayStopwatch.Stop();
-        Console.Write($" | Day: {dayStopwatch.Elapsed.TotalMinutes:F1}m");
-
-        return (successCount, failCount);
     }
 
-    private async Task<bool> ProcessTimeChunkWithRetry(DateTime startTime, DateTime endTime)
+    private async Task ProcessSecondChunkWithRetry(DateTime startTime, DateTime endTime)
     {
-        const int maxRetries = 10;
-        const int baseDelaySeconds = 5;
+        const int maxRetries = 5;
+        const int baseDelayMs = 500;
 
-        var chunkKey = $"{startTime:yyyy-MM-dd HH:mm}-{endTime:HH:mm}";
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-
-        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        await _semaphore.WaitAsync();
+        try
         {
-            try
+            for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
-                await ProcessTimeChunk(startTime, endTime);
-                stopwatch.Stop();
-                _chunkTimings[chunkKey] = stopwatch.Elapsed;
-
-                // Log timing after successful chunk (show less detail for 24 chunks)
-                if (stopwatch.Elapsed.TotalSeconds > 60)
+                try
                 {
-                    Console.Write($" [{stopwatch.Elapsed.TotalMinutes:F1}m]");
+                    await ProcessSecondChunk(startTime, endTime);
+                    Interlocked.Increment(ref _totalChunksProcessed);
+                    return; // Success
                 }
-                else
+                catch (Exception ex)
                 {
-                    Console.Write($" [{stopwatch.Elapsed.TotalSeconds:F0}s]");
-                }
-
-                return true; // Success!
-            }
-            catch (Exception ex)
-            {
-                if (attempt < maxRetries)
-                {
-                    // Exponential backoff: 5s, 10s, 20s, 40s, etc.
-                    var delaySeconds = baseDelaySeconds * (int)Math.Pow(2, attempt - 1);
-                    delaySeconds = Math.Min(delaySeconds, 120); // Max 2 minutes
-
-                    Console.Write($".");
-                    await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
-                }
-                else
-                {
-                    // All retries failed
-                    stopwatch.Stop();
-                    _failedChunks[chunkKey] = attempt;
-                    _chunkTimings[chunkKey] = stopwatch.Elapsed;
-                    return false;
+                    if (attempt < maxRetries)
+                    {
+                        var delayMs = baseDelayMs * (int)Math.Pow(2, attempt - 1);
+                        delayMs = Math.Min(delayMs, 5000); // Max 5 seconds
+                        await Task.Delay(delayMs);
+                    }
+                    else
+                    {
+                        // All retries failed
+                        var chunkKey = $"{startTime:yyyy-MM-dd HH:mm:ss}";
+                        _failedChunks.TryAdd(chunkKey, attempt);
+                        Interlocked.Increment(ref _totalChunksFailed);
+                    }
                 }
             }
         }
-
-        return false;
+        finally
+        {
+            _semaphore.Release();
+        }
     }
 
-    private async Task ProcessTimeChunk(DateTime startTime, DateTime endTime)
+    private async Task ProcessSecondChunk(DateTime startTime, DateTime endTime)
     {
-        CompositeKey afterKey = null;
-        int iteration = 0;
-        const int maxIterations = 500; 
-
-        do
-        {
-            iteration++;
-
-            var response = await _client.SearchAsync<object>(s => s
-                .Index("apxdr-repository")
-                .Size(0)
-                .Query(q => q
-                    .Bool(b => b
-                        .Must(
-                            m => m.DateRange(dr => dr
-                                .Field("@timestamp")
-                                .GreaterThanOrEquals(startTime)
-                                .LessThan(endTime)
-                            ),
-                            m => m.Bool(bb => bb
-                                .Should(
-                                    sh => sh.Exists(e => e.Field("To.File.Hash.SHA1")),
-                                    sh => sh.Exists(e => e.Field("To.Application.File.Hash.SHA1"))
-                                )
-                                .MinimumShouldMatch(1)
+        var response = await _client.SearchAsync<object>(s => s
+            .Index("")
+            .Size(0)
+            .Query(q => q
+                .Bool(b => b
+                    .Must(
+                        m => m.DateRange(dr => dr
+                            .Field("CollectDate")
+                            .GreaterThanOrEquals(startTime)
+                            .LessThan(endTime)
+                        ),
+                        m => m.Bool(bb => bb
+                            .Should(
+                                sh => sh.Exists(e => e.Field("")),
+                                sh => sh.Exists(e => e.Field(""))
+                            )
+                            .MinimumShouldMatch(1)
+                        )
+                    )
+                )
+            )
+            .Aggregations(a => a
+                .Terms("sha1_agg", t => t
+                    .Script(sc => sc
+                        .Source(@"
+                            def paths = [
+                              '',
+                              ''
+                            ];
+                
+                            for (path in paths) {
+                              try {
+                                if (doc.containsKey(path) && doc[path].size() > 0) {
+                                  def value = doc[path].value;
+                                  if (value != null && !value.isEmpty()) {
+                                    return value;
+                                  }
+                                }
+                              } catch (Exception e) {}
+                            }
+                
+                            return 'MISSING';
+                        ")
+                        .Lang("painless")
+                    )
+                    .Size(10000)
+                    .Aggregations(aa => aa
+                        .Max("file_size", m => m
+                            .Script(sc => sc
+                                .Source(@"
+                                    def sizePaths = [
+                                      '',
+                                      ''
+                                    ];
+                        
+                                    for (path in sizePaths) {
+                                      try {
+                                        if (doc.containsKey(path) && doc[path].size() > 0) {
+                                          return doc[path].value;
+                                        }
+                                      } catch (Exception e) {}
+                                    }
+                        
+                                    return 0;
+                                ")
+                                .Lang("painless")
                             )
                         )
                     )
                 )
-                .Aggregations(a => a
-                    .Composite("sha1_size_pagination", comp => comp
-                        .Size(10000)
-                        .After(afterKey)
-                        .Sources(src => src
-                            .Terms("sha1", t => t
-                                .Script(sc => sc
-                                    .Source(@"
-                                        def paths = [
-                                          'To.File.Hash.SHA1.keyword',
-                                          'To.Application.File.Hash.SHA1.keyword'          
-                                        ];
-                            
-                                        for (path in paths) {
-                                          try {
-                                            if (doc.containsKey(path) && doc[path].size() > 0) {
-                                              def value = doc[path].value;
-                                              if (value != null && !value.isEmpty()) {
-                                                return value;
-                                              }
-                                            }
-                                          } catch (Exception e) {}
-                                        }
-                            
-                                        return 'MISSING';
-                                    ")
-                                    .Lang("painless")
-                                )
-                            )
-                            .Terms("size", t => t
-                                .Script(sc => sc
-                                    .Source(@"
-                                        def sizePaths = [
-                                          'To.File.Size',                             
-                                          'To.Application.File.Size'                          
-                                        ];
-                            
-                                        for (path in sizePaths) {
-                                          try {
-                                            if (doc.containsKey(path) && doc[path].size() > 0) {
-                                              return doc[path].value;
-                                            }
-                                          } catch (Exception e) {}
-                                        }
-                            
-                                        return 0;
-                                    ")
-                                    .Lang("painless")
-                                )
-                            )
-                        )
-                    )
-                )
-            );
+            )
+        );
 
-            // Check for errors
-            if (!response.IsValid)
+        // Check for errors
+        if (!response.IsValid)
+        {
+            var errorMessage = "Unknown error";
+
+            if (response.ServerError != null)
             {
-                var errorMessage = "Unknown error";
-
-                if (response.ServerError != null)
-                {
-                    errorMessage = response.ServerError.Error?.Reason ?? "Server error";
-                }
-                else if (response.OriginalException != null)
-                {
-                    errorMessage = response.OriginalException.Message;
-                }
-                else if (response.ApiCall?.HttpStatusCode != null)
-                {
-                    errorMessage = $"HTTP {response.ApiCall.HttpStatusCode}";
-                }
-
-                throw new Exception($"ES error: {errorMessage}");
+                errorMessage = response.ServerError.Error?.Reason ?? "Server error";
+            }
+            else if (response.OriginalException != null)
+            {
+                errorMessage = response.OriginalException.Message;
+            }
+            else if (response.ApiCall?.HttpStatusCode != null)
+            {
+                errorMessage = $"HTTP {response.ApiCall.HttpStatusCode}";
             }
 
-            var composite = response.Aggregations.Composite("sha1_size_pagination");
+            throw new Exception($"ES error: {errorMessage}");
+        }
 
-            if (composite == null || composite.Buckets.Count == 0)
-                break;
+        var termsAgg = response.Aggregations.Terms("sha1_agg");
 
-            // Add SHA1s with file sizes to dictionary
-            foreach (var bucket in composite.Buckets)
+        if (termsAgg != null && termsAgg.Buckets.Count > 0)
+        {
+            foreach (var bucket in termsAgg.Buckets)
             {
-                string sha1 = null;
+                var sha1 = bucket.Key;
+
+                if (string.IsNullOrEmpty(sha1) || sha1 == "MISSING" || sha1 == "null")
+                    continue;
+
+                sha1 = sha1.ToUpperInvariant();
+
+                // Get file size from nested aggregation
                 long fileSize = 0;
-
-                // Get SHA1
-                if (bucket.Key.TryGetValue("sha1", out string sha1Value))
+                var maxSizeAgg = bucket.Max("file_size");
+                if (maxSizeAgg != null && maxSizeAgg.Value.HasValue)
                 {
-                    sha1 = sha1Value;
+                    fileSize = (long)maxSizeAgg.Value.Value;
                 }
 
-                // Get Size
-                if (bucket.Key.TryGetValue("size", out object sizeValue))
-                {
-                    if (sizeValue is long longSize)
-                    {
-                        fileSize = longSize;
-                    }
-                    else if (sizeValue is int intSize)
-                    {
-                        fileSize = intSize;
-                    }
-                    else if (sizeValue is double doubleSize)
-                    {
-                        fileSize = (long)doubleSize;
-                    }
-                    else if (sizeValue != null)
-                    {
-                        long.TryParse(sizeValue.ToString(), out fileSize);
-                    }
-                }
-
-                // Store in dictionary
-                if (!string.IsNullOrEmpty(sha1) && sha1 != "MISSING" && sha1 != "null")
-                {
-                    sha1 = sha1.ToUpperInvariant();
-
-                    // Store SHA1 with size (keep the first size we encounter)
-                    if (!_fileInfo.ContainsKey(sha1))
-                    {
-                        _fileInfo[sha1] = fileSize;
-                    }
-                }
+                // Store in concurrent dictionary (only if not already present)
+                _fileInfo.TryAdd(sha1, fileSize);
             }
-
-            // Get the after_key for next iteration
-            afterKey = composite.AfterKey;
-
-            // Safety check
-            if (iteration >= maxIterations)
-            {
-                Console.Write($"⚠MAX");
-                break;
-            }
-
-        } while (afterKey != null && afterKey.Count > 0);
+        }
     }
 
-    public int GetFailedChunksCount()
-    {
-        return _failedChunks.Count;
-    }
-
-    public Dictionary<string, int> GetFailedChunks()
+    public ConcurrentDictionary<string, int> GetFailedChunks()
     {
         return _failedChunks;
     }
 
-    public Dictionary<string, TimeSpan> GetChunkTimings()
-    {
-        return _chunkTimings;
-    }
-
-    public Dictionary<string, long> GetFileInfo()
+    public ConcurrentDictionary<string, long> GetFileInfo()
     {
         return _fileInfo;
     }
 
-    public Dictionary<DateTime, FileStatistics> GetDailyStatistics()
+    public ConcurrentDictionary<DateTime, FileStatistics> GetDailyStatistics()
     {
         return _dailyStatistics;
     }
 
-    public void PrintTimingStatistics()
+    public void PrintStatistics()
     {
-        if (_chunkTimings.Count == 0)
-            return;
+        Console.WriteLine("════════════════════════════════════════════════════════════════════════════════");
+        Console.WriteLine("                            PROCESSING STATISTICS");
+        Console.WriteLine("════════════════════════════════════════════════════════════════════════════════");
+        Console.WriteLine($"Total Chunks Processed:  {_totalChunksProcessed:N0}");
+        Console.WriteLine($"Total Chunks Failed:     {_totalChunksFailed:N0}");
+        Console.WriteLine($"Success Rate:            {(_totalChunksProcessed * 100.0 / (_totalChunksProcessed + _totalChunksFailed)):F2}%");
+        Console.WriteLine();
 
-        Console.WriteLine("\n================ TIMING STATISTICS ================");
+        var fileInfo = _fileInfo;
+        var filesWithSize = fileInfo.Count(kvp => kvp.Value > 0);
 
-        var avgTime = _chunkTimings.Values.Average(t => t.TotalSeconds);
-        var maxTime = _chunkTimings.Values.Max(t => t.TotalSeconds);
-        var minTime = _chunkTimings.Values.Min(t => t.TotalSeconds);
-        var totalTime = TimeSpan.FromSeconds(_chunkTimings.Values.Sum(t => t.TotalSeconds));
+        Console.WriteLine($"Files with Size Info:    {filesWithSize:N0} / {fileInfo.Count:N0} ({(filesWithSize * 100.0 / fileInfo.Count):F1}%)");
 
-        Console.WriteLine($"Total processing time: {totalTime.TotalHours:F2}h ({totalTime.TotalMinutes:F1}m)");
-        Console.WriteLine($"Average chunk time: {avgTime:F2}s");
-        Console.WriteLine($"Fastest chunk: {minTime:F2}s");
-        Console.WriteLine($"Slowest chunk: {maxTime:F2}s");
-        Console.WriteLine($"Total chunks: {_chunkTimings.Count}");
-
-        // Show slowest chunks
-        Console.WriteLine("\nTop 10 Slowest Chunks:");
-        foreach (var kvp in _chunkTimings.OrderByDescending(x => x.Value.TotalSeconds).Take(10))
+        if (filesWithSize > 0)
         {
-            Console.WriteLine($"  {kvp.Key}: {kvp.Value.TotalSeconds:F2}s");
+            var totalSize = fileInfo.Values.Where(s => s > 0).Sum();
+            var avgSize = fileInfo.Values.Where(s => s > 0).Average();
+            var maxSize = fileInfo.Values.Max();
+            var minSize = fileInfo.Values.Where(s => s > 0).Min();
+
+            Console.WriteLine($"Total Size:              {FormatBytes(totalSize)}");
+            Console.WriteLine($"Average Size:            {FormatBytes((long)avgSize)}");
+            Console.WriteLine($"Largest File:            {FormatBytes(maxSize)}");
+            Console.WriteLine($"Smallest File:           {FormatBytes(minSize)}");
         }
+        Console.WriteLine();
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes == 0) return "0 B";
+        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+        double len = bytes;
+        int order = 0;
+        while (len >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            len = len / 1024;
+        }
+        return $"{len:0.##} {sizes[order]}";
     }
 }
