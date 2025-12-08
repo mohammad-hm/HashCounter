@@ -17,10 +17,9 @@ class Program
 
         var startDate = DateTime.UtcNow.Date;
         var endDate = startDate.AddDays(-14);
-        //var endDate = startDate.AddMonths(-6);
 
         Console.WriteLine("╔════════════════════════════════════════════════════════════════════════════╗");
-        Console.WriteLine("║         PARALLEL UNIQUE SHA1 FILE COUNTER - 2 WEEK                         ║");
+        Console.WriteLine("║         PARALLEL UNIQUE SHA1 FILE COUNTER - 1 WEEKS                        ║");
         Console.WriteLine("╚════════════════════════════════════════════════════════════════════════════╝");
         Console.WriteLine($"Start Date:      {startDate:yyyy-MM-dd}");
         Console.WriteLine($"End Date:        {endDate:yyyy-MM-dd}");
@@ -153,17 +152,18 @@ public class ParallelUniqueFileCounter
     private readonly ConcurrentDictionary<string, long> _fileInfo = new ConcurrentDictionary<string, long>(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, int> _failedChunks = new ConcurrentDictionary<string, int>();
     private readonly ConcurrentDictionary<DateTime, FileStatistics> _dailyStatistics = new ConcurrentDictionary<DateTime, FileStatistics>();
-    private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(360); // Max 360 concurrent tasks
+    private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(60); // Max 60 concurrent tasks (1 hour)
 
     private long _totalChunksProcessed = 0;
     private long _totalChunksFailed = 0;
+    private long _totalCompositeIterations = 0;
 
     public ParallelUniqueFileCounter(string elasticsearchUrl)
     {
         var settings = new ConnectionSettings(new Uri(elasticsearchUrl))
             .BasicAuthentication("", "")
             .ServerCertificateValidationCallback((o, certificate, chain, errors) => true)
-            .RequestTimeout(TimeSpan.FromMinutes(2))
+            .RequestTimeout(TimeSpan.FromMinutes(5))
             .MaximumRetries(3)
             .ThrowExceptions(false);
 
@@ -186,7 +186,7 @@ public class ParallelUniqueFileCounter
             var dayStopwatch = Stopwatch.StartNew();
             var beforeCount = _fileInfo.Count;
 
-            Console.Write($"[{processedDays,4}/{totalDays}] {currentDate:yyyy-MM-dd} ");
+            Console.WriteLine($"[{processedDays,4}/{totalDays}] {currentDate:yyyy-MM-dd}");
 
             try
             {
@@ -205,12 +205,12 @@ public class ParallelUniqueFileCounter
                     ProcessingTime = dayStopwatch.Elapsed
                 };
 
-                Console.WriteLine($"✓ New: {newUnique,10:N0} | Total: {afterCount,11:N0} ({percentage,5:F1}%) | Time: {dayStopwatch.Elapsed.TotalMinutes,6:F1}m");
+                Console.WriteLine($"     ✓ New: {newUnique,10:N0} | Total: {afterCount,11:N0} ({percentage,5:F1}%) | Time: {dayStopwatch.Elapsed.TotalMinutes,6:F1}m");
             }
             catch (Exception ex)
             {
                 dayStopwatch.Stop();
-                Console.WriteLine($"✗ ERROR: {ex.Message}");
+                Console.WriteLine($"     ✗ ERROR: {ex.Message}");
             }
 
             currentDate = nextDate;
@@ -219,7 +219,7 @@ public class ParallelUniqueFileCounter
             if (processedDays % 30 == 0)
             {
                 var memoryMB = GC.GetTotalMemory(false) / (1024 * 1024);
-                Console.WriteLine($"     └─ Memory: {memoryMB:N0} MB | Unique SHA1s: {_fileInfo.Count:N0}");
+                Console.WriteLine($"     └─ Memory: {memoryMB:N0} MB | Unique SHA1s: {_fileInfo.Count:N0} | Composite Iterations: {_totalCompositeIterations:N0}");
             }
         }
 
@@ -235,62 +235,35 @@ public class ParallelUniqueFileCounter
 
     private async Task ProcessDayParallel(DateTime date)
     {
-        var tasks = new List<Task>();
-        var batchSize = 360; // 360 seconds per batch = 6 minutes
-        var totalBatches = 24 * 60 * 60 / batchSize; // 240 batches per day
+        // Process 24 hours in parallel 
+        var hourTasks = new List<Task>();
 
-        var successCount = 0;
-        var failCount = 0;
-        var batchProgress = 0;
-
-        var hourStopwatch = new Stopwatch();
-        hourStopwatch.Start();
-
-        for (int batchNum = 0; batchNum < totalBatches; batchNum++)
+        for (int hour = 0; hour < 24; hour++)
         {
-            var batchTasks = new List<Task>();
-            var startSecond = batchNum * batchSize;
-
-            // Create tasks for this batch (360 seconds)
-            for (int i = 0; i < batchSize; i++)
-            {
-                var second = startSecond + i;
-                var chunkStart = date.AddSeconds(second);
-                var chunkEnd = chunkStart.AddSeconds(1);
-
-                batchTasks.Add(ProcessSecondChunkWithRetry(chunkStart, chunkEnd));
-            }
-
-            // Wait for this batch to complete
-            await Task.WhenAll(batchTasks);
-
-            batchProgress++;
-
-            // Print progress indicator every 10 batches (every hour)
-            if (batchProgress % 10 == 0)
-            {
-                hourStopwatch.Stop();
-                Console.WriteLine($"\nHour #{batchProgress / 10} completed in {hourStopwatch.Elapsed}.");
-
-                // Restart for next hour
-                hourStopwatch.Restart();
-            }
+            var hourStart = date.AddHours(hour);
+            hourTasks.Add(ProcessHourWithRetry(hourStart, hour + 1));
         }
+
+        await Task.WhenAll(hourTasks);
     }
 
-    private async Task ProcessSecondChunkWithRetry(DateTime startTime, DateTime endTime)
+    private async Task ProcessHourWithRetry(DateTime hourStart, int hourNum)
     {
-        const int maxRetries = 5;
-        const int baseDelayMs = 500;
+        const int maxRetries = 10;
 
         await _semaphore.WaitAsync();
         try
         {
+            var hourStopwatch = Stopwatch.StartNew();
+
             for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
                 try
                 {
-                    await ProcessSecondChunk(startTime, endTime);
+                    await ProcessHourChunk(hourStart);
+                    hourStopwatch.Stop();
+
+                    Console.WriteLine($"     Hour #{hourNum,2} completed in {hourStopwatch.Elapsed}.");
                     Interlocked.Increment(ref _totalChunksProcessed);
                     return; // Success
                 }
@@ -298,16 +271,18 @@ public class ParallelUniqueFileCounter
                 {
                     if (attempt < maxRetries)
                     {
-                        var delayMs = baseDelayMs * (int)Math.Pow(2, attempt - 1);
-                        delayMs = Math.Min(delayMs, 5000); // Max 5 seconds
+                        var delayMs = 1000 * (int)Math.Pow(2, attempt - 1);
+                        delayMs = Math.Min(delayMs, 10000); // Max 10 seconds
                         await Task.Delay(delayMs);
                     }
                     else
                     {
                         // All retries failed
-                        var chunkKey = $"{startTime:yyyy-MM-dd HH:mm:ss}";
+                        hourStopwatch.Stop();
+                        var chunkKey = $"{hourStart:yyyy-MM-dd HH:00}";
                         _failedChunks.TryAdd(chunkKey, attempt);
                         Interlocked.Increment(ref _totalChunksFailed);
+                        Console.WriteLine($"     Hour #{hourNum,2} FAILED after {attempt} attempts: {ex.Message}");
                     }
                 }
             }
@@ -318,127 +293,174 @@ public class ParallelUniqueFileCounter
         }
     }
 
-    private async Task ProcessSecondChunk(DateTime startTime, DateTime endTime)
+    private async Task ProcessHourChunk(DateTime hourStart)
     {
-        var response = await _client.SearchAsync<object>(s => s
-            .Index("")
-            .Size(0)
-            .Query(q => q
-                .Bool(b => b
-                    .Must(
-                        m => m.DateRange(dr => dr
-                            .Field("CollectDate")
-                            .GreaterThanOrEquals(startTime)
-                            .LessThan(endTime)
-                        ),
-                        m => m.Bool(bb => bb
-                            .Should(
-                                sh => sh.Exists(e => e.Field("")),
-                                sh => sh.Exists(e => e.Field(""))
+        var hourEnd = hourStart.AddHours(1);
+        CompositeKey afterKey = null;
+        int iteration = 0;
+        const int maxIterations = 1000;
+
+        do
+        {
+            iteration++;
+            Interlocked.Increment(ref _totalCompositeIterations);
+
+            var response = await _client.SearchAsync<object>(s => s
+                .Index("")
+                .Size(0)
+                .Query(q => q
+                    .Bool(b => b
+                        .Must(
+                            m => m.DateRange(dr => dr
+                                .Field("")
+                                .GreaterThanOrEquals(hourStart)
+                                .LessThan(hourEnd)
+                            ),
+                            m => m.Bool(bb => bb
+                                .Should(
+                                    sh => sh.Exists(e => e.Field("")),
+                                    sh => sh.Exists(e => e.Field(""))
+                                )
+                                .MinimumShouldMatch(1)
                             )
-                            .MinimumShouldMatch(1)
                         )
                     )
                 )
-            )
-            .Aggregations(a => a
-                .Terms("sha1_agg", t => t
-                    .Script(sc => sc
-                        .Source(@"
-                            def paths = [
-                              '',
-                              ''
-                            ];
-                
-                            for (path in paths) {
-                              try {
-                                if (doc.containsKey(path) && doc[path].size() > 0) {
-                                  def value = doc[path].value;
-                                  if (value != null && !value.isEmpty()) {
-                                    return value;
-                                  }
-                                }
-                              } catch (Exception e) {}
-                            }
-                
-                            return 'MISSING';
-                        ")
-                        .Lang("painless")
-                    )
-                    .Size(10000)
-                    .Aggregations(aa => aa
-                        .Max("file_size", m => m
-                            .Script(sc => sc
-                                .Source(@"
-                                    def sizePaths = [
-                                      '',
-                                      ''
-                                    ];
-                        
-                                    for (path in sizePaths) {
-                                      try {
-                                        if (doc.containsKey(path) && doc[path].size() > 0) {
-                                          return doc[path].value;
+                .Aggregations(a => a
+                    .Composite("sha1_size_pagination", comp => comp
+                        .Size(10000)
+                        .After(afterKey)
+                        .Sources(src => src
+                            .Terms("sha1", t => t
+                                .Script(sc => sc
+                                    .Source(@"
+                                        def paths = [
+                                          '',
+                                          ''          
+                                        ];
+                            
+                                        for (path in paths) {
+                                          try {
+                                            if (doc.containsKey(path) && doc[path].size() > 0) {
+                                              def value = doc[path].value;
+                                              if (value != null && !value.isEmpty()) {
+                                                return value;
+                                              }
+                                            }
+                                          } catch (Exception e) {}
                                         }
-                                      } catch (Exception e) {}
-                                    }
-                        
-                                    return 0;
-                                ")
-                                .Lang("painless")
+                            
+                                        return 'MISSING';
+                                    ")
+                                    .Lang("painless")
+                                )
+                            )
+                            .Terms("size", t => t
+                                .Script(sc => sc
+                                    .Source(@"
+                                        def sizePaths = [
+                                          '',                             
+                                          ''                          
+                                        ];
+                            
+                                        for (path in sizePaths) {
+                                          try {
+                                            if (doc.containsKey(path) && doc[path].size() > 0) {
+                                              return doc[path].value;
+                                            }
+                                          } catch (Exception e) {}
+                                        }
+                            
+                                        return 0;
+                                    ")
+                                    .Lang("painless")
+                                )
                             )
                         )
                     )
                 )
-            )
-        );
+            );
 
-        // Check for errors
-        if (!response.IsValid)
-        {
-            var errorMessage = "Unknown error";
-
-            if (response.ServerError != null)
+            // Check for errors
+            if (!response.IsValid)
             {
-                errorMessage = response.ServerError.Error?.Reason ?? "Server error";
-            }
-            else if (response.OriginalException != null)
-            {
-                errorMessage = response.OriginalException.Message;
-            }
-            else if (response.ApiCall?.HttpStatusCode != null)
-            {
-                errorMessage = $"HTTP {response.ApiCall.HttpStatusCode}";
-            }
+                var errorMessage = "Unknown error";
 
-            throw new Exception($"ES error: {errorMessage}");
-        }
-
-        var termsAgg = response.Aggregations.Terms("sha1_agg");
-
-        if (termsAgg != null && termsAgg.Buckets.Count > 0)
-        {
-            foreach (var bucket in termsAgg.Buckets)
-            {
-                var sha1 = bucket.Key;
-
-                if (string.IsNullOrEmpty(sha1) || sha1 == "MISSING" || sha1 == "null")
-                    continue;
-
-                sha1 = sha1.ToUpperInvariant();
-
-                // Get file size from nested aggregation
-                long fileSize = 0;
-                var maxSizeAgg = bucket.Max("file_size");
-                if (maxSizeAgg != null && maxSizeAgg.Value.HasValue)
+                if (response.ServerError != null)
                 {
-                    fileSize = (long)maxSizeAgg.Value.Value;
+                    errorMessage = response.ServerError.Error?.Reason ?? "Server error";
+                }
+                else if (response.OriginalException != null)
+                {
+                    errorMessage = response.OriginalException.Message;
+                }
+                else if (response.ApiCall?.HttpStatusCode != null)
+                {
+                    errorMessage = $"HTTP {response.ApiCall.HttpStatusCode}";
                 }
 
-                // Store in concurrent dictionary (only if not already present)
-                _fileInfo.TryAdd(sha1, fileSize);
+                throw new Exception($"ES error: {errorMessage}");
             }
-        }
+
+            var composite = response.Aggregations.Composite("sha1_size_pagination");
+
+            if (composite == null || composite.Buckets.Count == 0)
+                break;
+
+            // Add SHA1s with file sizes to dictionary
+            foreach (var bucket in composite.Buckets)
+            {
+                string sha1 = null;
+                long fileSize = 0;
+
+                // Get SHA1
+                if (bucket.Key.TryGetValue("sha1", out string sha1Value))
+                {
+                    sha1 = sha1Value;
+                }
+
+                // Get Size
+                if (bucket.Key.TryGetValue("size", out object sizeValue))
+                {
+                    if (sizeValue is long longSize)
+                    {
+                        fileSize = longSize;
+                    }
+                    else if (sizeValue is int intSize)
+                    {
+                        fileSize = intSize;
+                    }
+                    else if (sizeValue is double doubleSize)
+                    {
+                        fileSize = (long)doubleSize;
+                    }
+                    else if (sizeValue != null)
+                    {
+                        long.TryParse(sizeValue.ToString(), out fileSize);
+                    }
+                }
+
+                // Store in dictionary
+                if (!string.IsNullOrEmpty(sha1) && sha1 != "MISSING" && sha1 != "null")
+                {
+                    sha1 = sha1.ToUpperInvariant();
+
+                    // Store SHA1 with size (only if not already present)
+                    _fileInfo.TryAdd(sha1, fileSize);
+                }
+            }
+
+            // Get the after_key for next iteration
+            afterKey = composite.AfterKey;
+
+            // Safety check
+            if (iteration >= maxIterations)
+            {
+                Console.WriteLine($"     ⚠ Hour {hourStart:HH:mm} reached max iterations ({maxIterations})");
+                break;
+            }
+
+        } while (afterKey != null && afterKey.Count > 0);
     }
 
     public ConcurrentDictionary<string, int> GetFailedChunks()
@@ -461,9 +483,10 @@ public class ParallelUniqueFileCounter
         Console.WriteLine("════════════════════════════════════════════════════════════════════════════════");
         Console.WriteLine("                            PROCESSING STATISTICS");
         Console.WriteLine("════════════════════════════════════════════════════════════════════════════════");
-        Console.WriteLine($"Total Chunks Processed:  {_totalChunksProcessed:N0}");
-        Console.WriteLine($"Total Chunks Failed:     {_totalChunksFailed:N0}");
-        Console.WriteLine($"Success Rate:            {(_totalChunksProcessed * 100.0 / (_totalChunksProcessed + _totalChunksFailed)):F2}%");
+        Console.WriteLine($"Total Hours Processed:       {_totalChunksProcessed:N0}");
+        Console.WriteLine($"Total Hours Failed:          {_totalChunksFailed:N0}");
+        Console.WriteLine($"Total Composite Iterations:  {_totalCompositeIterations:N0}");
+        Console.WriteLine($"Success Rate:                {(_totalChunksProcessed * 100.0 / (_totalChunksProcessed + _totalChunksFailed)):F2}%");
         Console.WriteLine();
 
         var fileInfo = _fileInfo;
